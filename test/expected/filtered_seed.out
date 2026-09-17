@@ -469,9 +469,8 @@ EXECUTE fs_union(6, 12);
 (1 row)
 
 DEALLOCATE fs_union;
--- LIMIT $1: a PARAM_EXTERN limit is evaluated at bind time, so even a
--- generic plan seeds from the real k.  Declared bigint because that is
--- the type the parser coerces a LIMIT to; see the depth section.
+-- LIMIT $1 is runtime state and cannot be carried in a planner query hint.
+-- Both parameter types therefore use normal backoff on a generic plan.
 PREPARE fs_lim(bigint) AS
 SELECT coalesce(array_agg(id ORDER BY id), ARRAY[]::int[]) FROM (
     SELECT id FROM fs_docs WHERE facet_id = 6
@@ -635,8 +634,8 @@ $q$) AS three_arm_passes;
                 3
 (1 row)
 
--- A correlated SubPlan is walked as its own root with the Limit inside
--- it, so it is seeded.  Every rescan hands tp_rescan the same ScanKey
+-- Core's walker finds the Limit inside a correlated SubPlan, so it is
+-- seeded.  Every rescan hands tp_rescan the same ScanKey
 -- array, so the seed is restored on each of the three evaluations
 -- rather than only the first.
 SELECT fs_passes($q$
@@ -653,12 +652,72 @@ $q$) AS correlated_subplan_passes;
                          3
 (1 row)
 
--- A generic plan's LIMIT is a PARAM_EXTERN, evaluated at bind time, so
--- it seeds where plan-time seeding could not fold the Param at all.
--- The parser coerces a LIMIT to bigint, so only a bigint parameter
--- reaches the Limit node as a bare Param: an int parameter arrives
--- wrapped in an int8() coercion, which is not something we evaluate at
--- bind time, and that scan falls back to default_limit plus backoff.
+-- Materialized CTEs are reached through their InitPlan.  Referencing
+-- the CTE twice still executes its single seeded scan only once.
+SELECT fs_passes($q$
+    WITH t AS MATERIALIZED (
+        SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
+        ORDER BY body <@> to_bm25query('common', 'fs_docs_idx') LIMIT 10)
+    SELECT id FROM t UNION ALL SELECT id FROM t
+$q$) AS materialized_cte_passes;
+ materialized_cte_passes 
+-------------------------
+                       1
+(1 row)
+
+-- An uncorrelated scalar subquery exercises the other InitPlan case.
+SELECT fs_passes($q$
+    SELECT (SELECT count(*) FROM (
+        SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
+        ORDER BY body <@> to_bm25query('common', 'fs_docs_idx')
+        LIMIT 10) s)
+$q$) AS initplan_passes;
+ initplan_passes 
+-----------------
+               1
+(1 row)
+
+-- Only direct Limit -> IndexScan pairs are seeded.  LockRows is an
+-- intentional boundary, even though it preserves ordering.  With
+-- fewer than 10 matches, the unseeded scan exhausts all 1000 candidates
+-- through backoff (100, 200, 400, 800, 1600): five scoring passes.
+EXPLAIN (COSTS OFF)
+SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
+ORDER BY body <@> to_bm25query('common', 'fs_docs_idx')
+LIMIT 10 FOR UPDATE;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Limit
+   ->  LockRows
+         ->  Index Scan using fs_docs_idx on fs_docs
+               Order By: (body <@> 'fs_docs_idx:common'::bm25query)
+               Filter: ((facet_id = 6) AND ((id % 7) = 3))
+(5 rows)
+
+SELECT fs_passes($q$
+    SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
+    ORDER BY body <@> to_bm25query('common', 'fs_docs_idx')
+    LIMIT 10 FOR UPDATE
+$q$) AS lockrows_fallback_passes;
+ lockrows_fallback_passes 
+--------------------------
+                        5
+(1 row)
+
+SELECT fs_check_q($q$
+    SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
+    ORDER BY body <@> to_bm25query('common', 'fs_docs_idx')
+    LIMIT 10 FOR UPDATE
+$q$) AS lockrows_fallback_parity;
+ lockrows_fallback_parity 
+--------------------------
+ PASS (3 rows)
+(1 row)
+
+-- A generic plan's LIMIT is a PARAM_EXTERN and cannot be folded into the
+-- planner-carried query hint, so it uses normal backoff.
+-- The parser coerces a LIMIT to bigint, while an int parameter arrives
+-- wrapped in an int8() coercion. Both cases intentionally fall back.
 PREPARE fs_dp_big(bigint) AS
     SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
     ORDER BY body <@> to_bm25query('common', 'fs_docs_idx') LIMIT $1;
@@ -682,7 +741,7 @@ $$;
 SELECT fs_generic_passes('EXECUTE fs_dp_big(10)', 6) AS bigint_param_passes;
  bigint_param_passes 
 ---------------------
-                   1
+                   5
 (1 row)
 
 SELECT fs_generic_passes('EXECUTE fs_dp_int(10)', 6) AS int_param_passes;

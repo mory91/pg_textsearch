@@ -23,11 +23,11 @@
 
 #include "access/am.h"
 #include "constants.h"
+#include "index/limit.h"
 #include "index/metapage.h"
 #include "index/resolve.h"
 #include "index/state.h"
 #include "memtable/scan.h"
-#include "planner/seed.h"
 #include "types/query.h"
 #include "types/vector.h"
 
@@ -166,9 +166,11 @@ tp_rescan_process_orderby(
 		/* Check for <@> operator strategy */
 		if (orderby->sk_strategy == 1) /* Strategy 1: <@> operator */
 		{
-			Datum query_datum = orderby->sk_argument;
-			char *query_cstr;
-			Oid	  query_index_oid = InvalidOid;
+			Datum  query_datum = orderby->sk_argument;
+			char  *query_cstr;
+			Oid	   query_index_oid = InvalidOid;
+			int64  hint_k;
+			double hint_selectivity;
 
 			/*
 			 * Use sk_subtype to determine the argument type.
@@ -188,6 +190,9 @@ tp_rescan_process_orderby(
 
 				query_cstr		= pstrdup(get_tpquery_text(query));
 				query_index_oid = get_tpquery_index_oid(query);
+				if (tpquery_get_seed_hint(query, &hint_k, &hint_selectivity))
+					so->limit = tp_seed_limit_for_filter(
+							(int)hint_k, hint_selectivity);
 
 				/* Validate index OID if provided in query */
 				if (tpquery_has_index(query))
@@ -295,21 +300,7 @@ tp_rescan(
 	if (!so)
 		return;
 
-	/*
-	 * Pull the seed bound to this scan at executor start.  The
-	 * orderbys pointer is this scan node's own ORDER BY ScanKey array,
-	 * which is what identifies it; a miss leaves -1, so scoring uses
-	 * tp_default_limit and the backoff below finds the top-k.
-	 */
-	{
-		int seed = -1;
-
-		if (norderbys > 0 && orderbys != NULL)
-			seed = tp_seed_lookup(
-					orderbys, RelationGetRelid(scan->indexRelation));
-
-		so->limit = (seed > 0) ? seed : -1;
-	}
+	so->limit = -1;
 
 	/* Reset scan state */
 	if (so)

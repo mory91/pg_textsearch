@@ -18,14 +18,10 @@
  * formula that turns a user LIMIT plus a filter selectivity into the
  * scan's internal top-K, and the default used when no LIMIT is known.
  *
- * Which scan a given seed belongs to is decided in planner/seed.c, at
- * executor start; nothing here is shared between statements.
+ * The planner carries scan-local hints in private bm25query values.
  */
 
 /* Default limit when none detected */
 extern int tp_default_limit;
 
-/*
- * Selectivity-seeded top-K formula for filtered BM25 search.
- */
 int tp_seed_limit_for_filter(int user_limit, double selectivity);

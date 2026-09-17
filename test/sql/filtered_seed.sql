@@ -377,9 +377,8 @@ RESET pg_textsearch.filtered_seed_margin;
 EXECUTE fs_union(6, 12);
 DEALLOCATE fs_union;
 
--- LIMIT $1: a PARAM_EXTERN limit is evaluated at bind time, so even a
--- generic plan seeds from the real k.  Declared bigint because that is
--- the type the parser coerces a LIMIT to; see the depth section.
+-- LIMIT $1 is runtime state and cannot be carried in a planner query hint.
+-- Both parameter types therefore use normal backoff on a generic plan.
 PREPARE fs_lim(bigint) AS
 SELECT coalesce(array_agg(id ORDER BY id), ARRAY[]::int[]) FROM (
     SELECT id FROM fs_docs WHERE facet_id = 6
@@ -494,8 +493,8 @@ SELECT fs_passes($q$
      ORDER BY body <@> to_bm25query('common', 'fs_docs_idx') LIMIT 10)
 $q$) AS three_arm_passes;
 
--- A correlated SubPlan is walked as its own root with the Limit inside
--- it, so it is seeded.  Every rescan hands tp_rescan the same ScanKey
+-- Core's walker finds the Limit inside a correlated SubPlan, so it is
+-- seeded.  Every rescan hands tp_rescan the same ScanKey
 -- array, so the seed is restored on each of the three evaluations
 -- rather than only the first.
 SELECT fs_passes($q$
@@ -508,12 +507,48 @@ SELECT fs_passes($q$
         FROM (VALUES (6), (13), (21)) v(fid)) y
 $q$) AS correlated_subplan_passes;
 
--- A generic plan's LIMIT is a PARAM_EXTERN, evaluated at bind time, so
--- it seeds where plan-time seeding could not fold the Param at all.
--- The parser coerces a LIMIT to bigint, so only a bigint parameter
--- reaches the Limit node as a bare Param: an int parameter arrives
--- wrapped in an int8() coercion, which is not something we evaluate at
--- bind time, and that scan falls back to default_limit plus backoff.
+-- Materialized CTEs are reached through their InitPlan.  Referencing
+-- the CTE twice still executes its single seeded scan only once.
+SELECT fs_passes($q$
+    WITH t AS MATERIALIZED (
+        SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
+        ORDER BY body <@> to_bm25query('common', 'fs_docs_idx') LIMIT 10)
+    SELECT id FROM t UNION ALL SELECT id FROM t
+$q$) AS materialized_cte_passes;
+
+-- An uncorrelated scalar subquery exercises the other InitPlan case.
+SELECT fs_passes($q$
+    SELECT (SELECT count(*) FROM (
+        SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
+        ORDER BY body <@> to_bm25query('common', 'fs_docs_idx')
+        LIMIT 10) s)
+$q$) AS initplan_passes;
+
+-- Only direct Limit -> IndexScan pairs are seeded.  LockRows is an
+-- intentional boundary, even though it preserves ordering.  With
+-- fewer than 10 matches, the unseeded scan exhausts all 1000 candidates
+-- through backoff (100, 200, 400, 800, 1600): five scoring passes.
+EXPLAIN (COSTS OFF)
+SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
+ORDER BY body <@> to_bm25query('common', 'fs_docs_idx')
+LIMIT 10 FOR UPDATE;
+
+SELECT fs_passes($q$
+    SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
+    ORDER BY body <@> to_bm25query('common', 'fs_docs_idx')
+    LIMIT 10 FOR UPDATE
+$q$) AS lockrows_fallback_passes;
+
+SELECT fs_check_q($q$
+    SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
+    ORDER BY body <@> to_bm25query('common', 'fs_docs_idx')
+    LIMIT 10 FOR UPDATE
+$q$) AS lockrows_fallback_parity;
+
+-- A generic plan's LIMIT is a PARAM_EXTERN and cannot be folded into the
+-- planner-carried query hint, so it uses normal backoff.
+-- The parser coerces a LIMIT to bigint, while an int parameter arrives
+-- wrapped in an int8() coercion. Both cases intentionally fall back.
 PREPARE fs_dp_big(bigint) AS
     SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
     ORDER BY body <@> to_bm25query('common', 'fs_docs_idx') LIMIT $1;
