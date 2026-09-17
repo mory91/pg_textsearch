@@ -6,24 +6,35 @@
  */
 #include <postgres.h>
 
+#include <access/genam.h>
 #include <access/relation.h>
 #include <access/reloptions.h>
+#include <access/skey.h>
+#include <access/table.h>
 #include <access/xact.h>
 #include <catalog/dependency.h>
+#include <catalog/indexing.h>
 #include <catalog/objectaccess.h>
 #include <catalog/pg_class_d.h>
+#include <catalog/pg_extension_d.h>
+#include <catalog/pg_inherits_d.h>
+#include <commands/extension.h>
 #include <fmgr.h>
 #include <limits.h>
 #include <miscadmin.h>
 #include <nodes/parsenodes.h>
 #include <pg_config.h>
 #include <storage/ipc.h>
+#include <storage/lock.h>
 #include <storage/shmem.h>
 #include <tcop/utility.h>
+#include <utils/fmgroids.h>
 #include <utils/guc.h>
 #include <utils/inval.h>
+#include <utils/snapmgr.h>
 
 #include "access/am.h"
+#include "access/rls.h"
 #include "constants.h"
 #include "index/compaction_request.h"
 #include "index/limit.h"
@@ -68,6 +79,9 @@ int tp_segments_per_level = TP_DEFAULT_SEGMENTS_PER_LEVEL;
 
 /* Conservative size budget for newly merged multi-source segments. */
 int tp_max_segment_size_mb = TP_DEFAULT_SEGMENT_SIZE_MB;
+
+/* Allow BM25 indexes on relations protected by row-level security. */
+bool tp_allow_rls = true;
 
 static const relopt_enum_elt_def compaction_mode_options[] =
 		{{"inline", TP_COMPACTION_INLINE},
@@ -136,13 +150,155 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 /* Previous ProcessUtility hook */
 static ProcessUtility_hook_type prev_process_utility_hook = NULL;
 
+typedef struct TpProcessUtilityContext
+{
+	struct TpProcessUtilityContext *previous;
+	bool							extension_lifecycle;
+	bool							track_index_build;
+	bool							check_rls_enable;
+	bool							check_hierarchy_change;
+	bool							track_relation_create;
+	bool							serialize_rls_ddl;
+	bool							retain_rls_ddl_lock;
+	bool							allow_rls;
+	bool							rls_ddl_lock_acquired;
+	LOCKMODE						rls_ddl_lock_mode;
+	bool							build_progress_started;
+	Oid								rls_ddl_lock_object;
+	List						   *altered_relids;
+	List						   *hierarchy_relids;
+} TpProcessUtilityContext;
+
+static TpProcessUtilityContext *current_utility_context = NULL;
+
+bool
+tp_rls_allowed_for_current_utility(void)
+{
+	if (current_utility_context != NULL)
+		return current_utility_context->allow_rls;
+
+	return tp_allow_rls;
+}
+
+void
+tp_rls_note_bm25_build(void)
+{
+	if (current_utility_context != NULL)
+		current_utility_context->retain_rls_ddl_lock = true;
+}
+
+/*
+ * Commands allowed to create an RLS/BM25 combination take a shared lock;
+ * commands enforcing the restriction and extension lifecycle commands take
+ * an exclusive lock.  The stable lock serializes across extension OID
+ * replacement, while the current extension-object lock preserves core lock
+ * ordering.  Session ownership survives internal commits; transaction
+ * ownership covers completed protected changes through commit.
+ *
+ * Nested acquisition without an inherited lock, or an exclusive request while
+ * this backend holds only a shared lock, must not wait.  Either case can
+ * invert lock order with an outer command or deadlock with another backend
+ * upgrading the same lock.
+ */
+static bool
+acquire_rls_ddl_lock(
+		LOCKMODE lockmode,
+		bool	 nested,
+		bool	 extension_lifecycle,
+		Oid		*extension_oid_out)
+{
+	LOCKTAG			  stable_tag;
+	LOCKTAG			  extension_tag;
+	LockAcquireResult result;
+	Oid				  extension_oid = InvalidOid;
+	bool			  dont_wait;
+
+	if (!extension_lifecycle &&
+		!OidIsValid(get_extension_oid("pg_textsearch", true)))
+		return false;
+
+	SET_LOCKTAG_OBJECT(
+			stable_tag, MyDatabaseId, ExtensionRelationId, InvalidOid, 0);
+	dont_wait = (lockmode == ExclusiveLock &&
+				 LockHeldByMe(&stable_tag, ShareLock, false) &&
+				 !LockHeldByMe(&stable_tag, ExclusiveLock, true)) ||
+				(nested && !LockHeldByMe(&stable_tag, lockmode, true));
+	result = LockAcquire(&stable_tag, lockmode, true, dont_wait);
+	if (result == LOCKACQUIRE_NOT_AVAIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+				 errmsg("could not acquire the pg_textsearch RLS DDL lock"),
+				 errdetail(
+						 "Protected DDL was invoked from a nested utility "
+						 "command whose outer command does not hold the "
+						 "pg_textsearch DDL lock."),
+				 errhint("Retry the outer command.")));
+
+	extension_oid = get_extension_oid("pg_textsearch", true);
+	if (OidIsValid(extension_oid))
+	{
+		SET_LOCKTAG_OBJECT(
+				extension_tag,
+				MyDatabaseId,
+				ExtensionRelationId,
+				extension_oid,
+				0);
+		result = LockAcquire(&extension_tag, lockmode, true, dont_wait);
+		if (result == LOCKACQUIRE_NOT_AVAIL)
+		{
+			(void)LockRelease(&stable_tag, lockmode, true);
+			ereport(ERROR,
+					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+					 errmsg("could not acquire the pg_textsearch RLS DDL "
+							"lock"),
+					 errdetail(
+							 "Protected DDL was invoked from a nested utility "
+							 "command whose outer command does not hold the "
+							 "pg_textsearch DDL lock."),
+					 errhint("Retry the outer command.")));
+		}
+	}
+
+	*extension_oid_out = extension_oid;
+	return true;
+}
+
+static void
+release_rls_ddl_lock(
+		Oid extension_oid, LOCKMODE lockmode, bool keep_transaction_lock)
+{
+	LOCKTAG stable_tag;
+	LOCKTAG extension_tag;
+
+	SET_LOCKTAG_OBJECT(
+			stable_tag, MyDatabaseId, ExtensionRelationId, InvalidOid, 0);
+	if (OidIsValid(extension_oid))
+		SET_LOCKTAG_OBJECT(
+				extension_tag,
+				MyDatabaseId,
+				ExtensionRelationId,
+				extension_oid,
+				0);
+
+	if (keep_transaction_lock)
+	{
+		(void)LockAcquire(&stable_tag, lockmode, false, false);
+		if (OidIsValid(extension_oid))
+			(void)LockAcquire(&extension_tag, lockmode, false, false);
+	}
+
+	if (OidIsValid(extension_oid))
+		(void)LockRelease(&extension_tag, lockmode, true);
+	(void)LockRelease(&stable_tag, lockmode, true);
+}
+
 /* Shared memory size calculation */
 static void tp_shmem_request(void);
 
 /* Shared memory startup hook */
 static void tp_shmem_startup(void);
 
-/* Object access hook for DROP INDEX detection */
+/* Object access hook for catalog-object validation and DROP INDEX cleanup */
 static void tp_object_access(
 		ObjectAccessType access,
 		Oid				 classId,
@@ -160,7 +316,7 @@ static void tp_subxact_callback(
 		SubTransactionId parentSubid,
 		void			*arg);
 
-/* ProcessUtility hook for tracking CREATE INDEX USING bm25 */
+/* ProcessUtility hook for nestable DDL validation and build tracking */
 static void tp_process_utility(
 		PlannedStmt			 *pstmt,
 		const char			 *queryString,
@@ -406,6 +562,20 @@ _PG_init(void)
 			NULL);
 
 	DefineCustomBoolVariable(
+			"pg_textsearch.allow_rls",
+			"Allow BM25 indexes on row-level security tables.",
+			"When disabled, BM25 indexes cannot be created or rebuilt on "
+			"RLS-protected relations, and RLS cannot be enabled on relations "
+			"that have BM25 indexes.",
+			&tp_allow_rls,
+			true,
+			PGC_SUSET,
+			0,
+			NULL,
+			NULL,
+			NULL);
+
+	DefineCustomBoolVariable(
 			"pg_textsearch.debug_panic_after_spill_finalize",
 			"Trigger PANIC after spill finalize for crash-safety testing.",
 			"When enabled, forces a server crash immediately after "
@@ -533,7 +703,7 @@ _PG_init(void)
 }
 
 /*
- * Object access hook - handle DROP INDEX
+ * Object access hook - enforce catalog-object RLS checks and handle drops.
  */
 static void
 tp_object_access(
@@ -543,11 +713,51 @@ tp_object_access(
 		int				 subId,
 		void			*arg)
 {
-	(void)arg; /* unused - we don't care about drop flags */
-
 	/* Call previous hook if exists */
 	if (prev_object_access_hook)
 		prev_object_access_hook(access, classId, objectId, subId, arg);
+
+	if (access == OAT_POST_CREATE && classId == RelationRelationId &&
+		subId == 0)
+	{
+		bool is_bm25 = tp_check_bm25_index_create_allowed(objectId);
+
+		if (is_bm25 && current_utility_context != NULL &&
+			current_utility_context->track_index_build &&
+			!current_utility_context->build_progress_started)
+		{
+			tp_build_progress_begin();
+			current_utility_context->build_progress_started = true;
+		}
+
+		if (current_utility_context != NULL &&
+			(is_bm25 || current_utility_context->track_relation_create))
+			current_utility_context->retain_rls_ddl_lock = true;
+	}
+
+	if (access == OAT_POST_ALTER && current_utility_context != NULL &&
+		subId == 0)
+	{
+		if (classId == RelationRelationId &&
+			current_utility_context->check_rls_enable &&
+			!list_member_oid(
+					current_utility_context->altered_relids, objectId))
+		{
+			current_utility_context->altered_relids = lappend_oid(
+					current_utility_context->altered_relids, objectId);
+			current_utility_context->retain_rls_ddl_lock = true;
+		}
+		else if (
+				classId == InheritsRelationId &&
+				current_utility_context->check_hierarchy_change &&
+				!list_member_oid(
+						current_utility_context->hierarchy_relids, objectId))
+		{
+			current_utility_context->hierarchy_relids = lappend_oid(
+					current_utility_context->hierarchy_relids, objectId);
+			current_utility_context->retain_rls_ddl_lock = true;
+		}
+	}
 
 	/* We only care about DROP events on relations (indexes are relations) */
 	if (access == OAT_DROP && classId == RelationRelationId && subId == 0)
@@ -686,13 +896,159 @@ tp_subxact_callback(
 	}
 }
 
-/*
- * ProcessUtility hook - detect CREATE INDEX USING bm25 and wrap
- * with build progress tracking. This collapses per-partition
- * NOTICEs into a single summary for partitioned tables.
- */
 static void
-tp_process_utility(
+initialize_utility_context(
+		TpProcessUtilityContext *utility_context, Node *stmt)
+{
+	memset(utility_context, 0, sizeof(*utility_context));
+	utility_context->previous  = current_utility_context;
+	utility_context->allow_rls = tp_allow_rls;
+
+	if (IsA(stmt, CreateExtensionStmt))
+	{
+		CreateExtensionStmt *create_stmt = castNode(CreateExtensionStmt, stmt);
+
+		utility_context->extension_lifecycle = strcmp(create_stmt->extname,
+													  "pg_textsearch") == 0;
+	}
+	else if (IsA(stmt, AlterExtensionStmt))
+	{
+		AlterExtensionStmt *alter_stmt = castNode(AlterExtensionStmt, stmt);
+
+		utility_context->extension_lifecycle = strcmp(alter_stmt->extname,
+													  "pg_textsearch") == 0;
+	}
+	else if (IsA(stmt, AlterExtensionContentsStmt))
+	{
+		AlterExtensionContentsStmt *alter_stmt =
+				castNode(AlterExtensionContentsStmt, stmt);
+
+		utility_context->extension_lifecycle = strcmp(alter_stmt->extname,
+													  "pg_textsearch") == 0;
+	}
+	else if (IsA(stmt, DropStmt))
+	{
+		DropStmt *drop_stmt = castNode(DropStmt, stmt);
+		ListCell *lc;
+
+		if (drop_stmt->removeType == OBJECT_EXTENSION)
+		{
+			foreach (lc, drop_stmt->objects)
+			{
+				List *name = lfirst(lc);
+
+				if (list_length(name) == 1 &&
+					strcmp(strVal(linitial(name)), "pg_textsearch") == 0)
+				{
+					utility_context->extension_lifecycle = true;
+					break;
+				}
+			}
+		}
+	}
+
+	if (utility_context->extension_lifecycle)
+	{
+		utility_context->serialize_rls_ddl	 = true;
+		utility_context->retain_rls_ddl_lock = true;
+	}
+	else if (IsA(stmt, IndexStmt))
+	{
+		IndexStmt *index_stmt = castNode(IndexStmt, stmt);
+
+		utility_context->track_index_build = true;
+		utility_context->serialize_rls_ddl = index_stmt->accessMethod !=
+													 NULL &&
+											 strcmp(index_stmt->accessMethod,
+													"bm25") == 0;
+	}
+	else if (IsA(stmt, ReindexStmt))
+		utility_context->serialize_rls_ddl = true;
+	else if (IsA(stmt, CreateStmt))
+	{
+		CreateStmt *create_stmt = castNode(CreateStmt, stmt);
+
+		if (create_stmt->inhRelations != NIL)
+		{
+			utility_context->serialize_rls_ddl	   = true;
+			utility_context->track_relation_create = true;
+		}
+	}
+	else if (IsA(stmt, AlterTableStmt))
+	{
+		AlterTableStmt *alter_stmt = castNode(AlterTableStmt, stmt);
+		ListCell	   *lc;
+
+		foreach (lc, alter_stmt->cmds)
+		{
+			AlterTableCmd *cmd = lfirst_node(AlterTableCmd, lc);
+
+			if (cmd->subtype == AT_EnableRowSecurity)
+			{
+				utility_context->check_rls_enable  = true;
+				utility_context->serialize_rls_ddl = true;
+			}
+			else if (
+					cmd->subtype == AT_AddInherit ||
+					(cmd->subtype == AT_AttachPartition &&
+					 alter_stmt->objtype == OBJECT_TABLE))
+			{
+				utility_context->check_hierarchy_change = true;
+				utility_context->serialize_rls_ddl		= true;
+			}
+		}
+	}
+}
+
+static bool
+relation_exists(Oid relid)
+{
+	Relation	class_rel;
+	ScanKeyData key;
+	SysScanDesc scan;
+	bool		exists;
+
+	/* End triggers can delete the tuple in the current command. */
+	class_rel = table_open(RelationRelationId, AccessShareLock);
+	ScanKeyInit(
+			&key,
+			Anum_pg_class_oid,
+			BTEqualStrategyNumber,
+			F_OIDEQ,
+			ObjectIdGetDatum(relid));
+	scan = systable_beginscan(
+			class_rel, ClassOidIndexId, true, SnapshotSelf, 1, &key);
+	exists = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(class_rel, AccessShareLock);
+
+	return exists;
+}
+
+static void
+validate_utility_context(TpProcessUtilityContext *utility_context)
+{
+	ListCell *lc;
+
+	foreach (lc, utility_context->altered_relids)
+	{
+		Oid relid = lfirst_oid(lc);
+
+		if (relation_exists(relid))
+			tp_check_rls_enable_allowed(relid);
+	}
+
+	foreach (lc, utility_context->hierarchy_relids)
+	{
+		Oid relid = lfirst_oid(lc);
+
+		if (relation_exists(relid))
+			tp_check_bm25_hierarchy_allowed(relid);
+	}
+}
+
+static void
+call_next_process_utility(
 		PlannedStmt			 *pstmt,
 		const char			 *queryString,
 		bool				  readOnlyTree,
@@ -702,43 +1058,6 @@ tp_process_utility(
 		DestReceiver		 *dest,
 		QueryCompletion		 *qc)
 {
-	Node *parsetree = pstmt->utilityStmt;
-
-	if (IsA(parsetree, IndexStmt))
-	{
-		IndexStmt *stmt = (IndexStmt *)parsetree;
-
-		if (stmt->accessMethod && strcmp(stmt->accessMethod, "bm25") == 0)
-		{
-			tp_build_progress_begin();
-
-			if (prev_process_utility_hook)
-				prev_process_utility_hook(
-						pstmt,
-						queryString,
-						readOnlyTree,
-						context,
-						params,
-						queryEnv,
-						dest,
-						qc);
-			else
-				standard_ProcessUtility(
-						pstmt,
-						queryString,
-						readOnlyTree,
-						context,
-						params,
-						queryEnv,
-						dest,
-						qc);
-
-			tp_build_progress_end();
-			return;
-		}
-	}
-
-	/* Not a bm25 CREATE INDEX - pass through */
 	if (prev_process_utility_hook)
 		prev_process_utility_hook(
 				pstmt,
@@ -759,6 +1078,99 @@ tp_process_utility(
 				queryEnv,
 				dest,
 				qc);
+}
+
+/*
+ * ProcessUtility hook - isolate each utility command's object-access events,
+ * post-validate ALTER TABLE catalog state, and preserve partitioned build
+ * progress tracking.
+ */
+static void
+tp_process_utility(
+		PlannedStmt			 *pstmt,
+		const char			 *queryString,
+		bool				  readOnlyTree,
+		ProcessUtilityContext context,
+		ParamListInfo		  params,
+		QueryEnvironment	 *queryEnv,
+		DestReceiver		 *dest,
+		QueryCompletion		 *qc)
+{
+	TpProcessUtilityContext *utility_context;
+
+	utility_context =
+			MemoryContextAllocZero(TopMemoryContext, sizeof(*utility_context));
+	initialize_utility_context(utility_context, pstmt->utilityStmt);
+	current_utility_context = utility_context;
+
+	PG_TRY();
+	{
+		if (utility_context->serialize_rls_ddl)
+		{
+			utility_context->rls_ddl_lock_mode =
+					utility_context->extension_lifecycle ||
+									!utility_context->allow_rls
+							? ExclusiveLock
+							: ShareLock;
+			utility_context->rls_ddl_lock_acquired = acquire_rls_ddl_lock(
+					utility_context->rls_ddl_lock_mode,
+					utility_context->previous != NULL,
+					utility_context->extension_lifecycle,
+					&utility_context->rls_ddl_lock_object);
+		}
+
+		call_next_process_utility(
+				pstmt,
+				queryString,
+				readOnlyTree,
+				context,
+				params,
+				queryEnv,
+				dest,
+				qc);
+
+		validate_utility_context(utility_context);
+
+		if (utility_context->build_progress_started)
+		{
+			utility_context->build_progress_started = false;
+			tp_build_progress_end();
+		}
+
+		if (utility_context->rls_ddl_lock_acquired)
+		{
+			release_rls_ddl_lock(
+					utility_context->rls_ddl_lock_object,
+					utility_context->rls_ddl_lock_mode,
+					utility_context->retain_rls_ddl_lock);
+			utility_context->rls_ddl_lock_acquired = false;
+		}
+
+		current_utility_context = utility_context->previous;
+		list_free(utility_context->altered_relids);
+		list_free(utility_context->hierarchy_relids);
+		pfree(utility_context);
+	}
+	PG_CATCH();
+	{
+		current_utility_context = utility_context->previous;
+		if (utility_context->build_progress_started)
+		{
+			utility_context->build_progress_started = false;
+			tp_build_progress_abort();
+		}
+		if (utility_context->rls_ddl_lock_acquired)
+		{
+			release_rls_ddl_lock(
+					utility_context->rls_ddl_lock_object,
+					utility_context->rls_ddl_lock_mode,
+					false);
+			utility_context->rls_ddl_lock_acquired = false;
+		}
+		pfree(utility_context);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /*
