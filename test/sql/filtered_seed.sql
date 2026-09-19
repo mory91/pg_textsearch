@@ -353,9 +353,9 @@ FROM (VALUES
 ) v(n, what, q1, q2)
 ORDER BY n;
 
--- Cached plans: the seed is bound at every ExecutorStart, so the
--- custom-to-generic plan flip (which happens on the sixth EXECUTE)
--- and a margin change between executes must not alter the result.
+-- Cached plans: possible custom-to-generic plan changes and changes
+-- to the margin between executions must preserve results, whether the
+-- scan receives a query hint or falls back to normal backoff.
 PREPARE fs_union(int, int) AS
 SELECT coalesce(array_agg(id ORDER BY id), ARRAY[]::int[]) FROM (
     (SELECT id FROM fs_docs WHERE facet_id = $1
@@ -377,7 +377,7 @@ RESET pg_textsearch.filtered_seed_margin;
 EXECUTE fs_union(6, 12);
 DEALLOCATE fs_union;
 
--- LIMIT $1 is runtime state and cannot be carried in a planner query hint.
+-- An unresolved LIMIT $1 cannot be carried in a planner query hint.
 -- Both parameter types therefore use normal backoff on a generic plan.
 PREPARE fs_lim(bigint) AS
 SELECT coalesce(array_agg(id ORDER BY id), ARRAY[]::int[]) FROM (
@@ -493,10 +493,9 @@ SELECT fs_passes($q$
      ORDER BY body <@> to_bm25query('common', 'fs_docs_idx') LIMIT 10)
 $q$) AS three_arm_passes;
 
--- Core's walker finds the Limit inside a correlated SubPlan, so it is
--- seeded.  Every rescan hands tp_rescan the same ScanKey
--- array, so the seed is restored on each of the three evaluations
--- rather than only the first.
+-- The planner walker finds the Limit inside a correlated SubPlan.
+-- Every rescan reads the hint from its query value, restoring the seed
+-- on each of the three evaluations.
 SELECT fs_passes($q$
     SELECT sum(c) FROM (
         SELECT (SELECT count(*) FROM (

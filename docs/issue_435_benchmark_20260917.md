@@ -1,6 +1,6 @@
 # Filtered-seed approach comparison — 2026-09-17
 
-Compared committed branch HEAD `d20852ed` (executor hook and scan-identity registry) with the current uncommitted query-carried hint implementation. PostgreSQL 18.4, 200,000 documents, identical data and ANALYZE statistics, dedicated local server. Existing `benchmarks/sql/filtered_seed.sql` workload; setup executed once and measurements repeated without dropping data. Each cell is the median of seven timed executions after warmup. Order: hint, original, original, hint, with server restarts when switching binaries. Seeding enabled in the table.
+Compared committed branch HEAD `d20852ed` (executor hook and scan-identity registry) with the query-carried hint implementation subsequently recorded in `b26fed76`. PostgreSQL 18.4, 200,000 documents, identical data and ANALYZE statistics, dedicated local server. Existing `benchmarks/sql/filtered_seed.sql` workload; setup executed once and measurements repeated without dropping data. Each cell is the median of seven timed executions after warmup. Order: hint, original, original, hint, with server restarts when switching binaries. Seeding enabled in the table.
 
 | Shape | Selectivity | LIMIT | Original run 1 / 2 (ms) | Hint run 1 / 2 (ms) | Passes, both |
 | --- | --- | --- | --- | --- | --- |

@@ -17,7 +17,7 @@
 --   single  - one BM25 scan.  This is #434, which shipped earlier.
 --   union2  - two or three BM25 scans of ONE index in one statement,
 --   union3    each with its own Filter.  This is #435: the seed is
---             bound per scan, keyed by scan identity.  Before that fix
+--             carried per scan in its query value. Before that fix
 --             one arm consumed the single per-index slot and the rest
 --             fell back to pg_textsearch.default_limit plus backoff,
 --             so the 'on' numbers for these shapes are only achievable

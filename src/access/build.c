@@ -212,16 +212,6 @@ tp_finish_spill(
 										 ? PG_UINT16_MAX
 										 : tp_max_segments_per_level;
 
-	if (spill->num_terms == 0)
-	{
-		/*
-		 * Chain exists but yielded no terms (e.g. records with
-		 * empty vectors).  Still publish the spill: we want the
-		 * chain reset and the doc-length contribution applied.
-		 */
-		root = InvalidBlockNumber;
-	}
-	else
 	{
 		TpIndexMetaPage metap = tp_get_metapage(index_rel);
 
@@ -230,10 +220,10 @@ tp_finish_spill(
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("bm25 segment count limit reached at level 0")));
 		pfree(metap);
-
-		root = tp_write_segment(
-				index_rel, spill->terms, spill->num_terms, spill->docmap);
 	}
+
+	root = tp_write_segment(
+			index_rel, spill->terms, spill->num_terms, spill->docmap);
 
 	if (out_segment_root != NULL)
 		*out_segment_root = root;
@@ -316,7 +306,7 @@ tp_finish_spill(
 		else if (tp_compaction_needed(index_rel))
 			tp_compaction_request(RelationGetRelid(index_rel));
 		break;
-	case TP_COMPACTION_OFF:
+	case TP_COMPACTION_MANUAL:
 		break;
 	}
 	pgstat_progress_update_param(
@@ -1238,7 +1228,7 @@ tp_process_document_text(
 	doc_length = tp_tokenize_text(
 			document_text, text_config_oid, &terms, &frequencies, &term_count);
 
-	if (term_count > 0 && index_rel != NULL)
+	if (index_rel != NULL)
 	{
 		char	 *index_name = get_rel_name(RelationGetRelid(index_rel));
 		TpVector *tpvec;
@@ -1357,16 +1347,8 @@ tp_build_callback(
 
 	MemoryContextSwitchTo(oldctx);
 
-	if (term_count > 0)
-	{
-		tp_build_context_add_document(
-				bs->build_ctx,
-				terms,
-				frequencies,
-				term_count,
-				doc_length,
-				ctid);
-	}
+	tp_build_context_add_document(
+			bs->build_ctx, terms, frequencies, term_count, doc_length, ctid);
 
 	/* Reset per-doc context (frees tsvector, terms) */
 	MemoryContextReset(bs->per_doc_ctx);
@@ -1382,11 +1364,7 @@ tp_build_callback(
 
 		pgstat_progress_update_param(
 				PROGRESS_CREATEIDX_SUBPHASE, TP_PHASE_COMPACTING);
-		/*
-		 * CREATE INDEX always compacts inline because another session
-		 * cannot open it until the build commits.  Off remains off.
-		 */
-		if (tp_index_compaction_mode(bs->index) != TP_COMPACTION_OFF)
+		if (tp_index_compaction_mode(bs->index) == TP_COMPACTION_INLINE)
 			tp_maybe_compact_level(bs->index_state, bs->index, 0);
 		pgstat_progress_update_param(
 				PROGRESS_CREATEIDX_SUBPHASE, TP_PHASE_LOADING);
@@ -1691,7 +1669,7 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		if (build_ctx->num_docs > 0)
 		{
 			tp_build_flush_and_link(build_ctx, index);
-			if (tp_index_compaction_mode(index) != TP_COMPACTION_OFF)
+			if (tp_index_compaction_mode(index) == TP_COMPACTION_INLINE)
 			{
 				pgstat_progress_update_param(
 						PROGRESS_CREATEIDX_SUBPHASE, TP_PHASE_COMPACTING);
@@ -1935,7 +1913,7 @@ tp_insert(
 	/* --- Phase 2: Shared-memory + chain-page work (under lock) --- */
 	index_state = tp_get_local_index_state(RelationGetRelid(index));
 
-	if (index_state != NULL && term_count > 0)
+	if (index_state != NULL)
 	{
 		/*
 		 * Acquire per-index lock in SHARED mode.  Phase 4 does
@@ -1971,7 +1949,7 @@ tp_insert(
 		 */
 		tp_auto_spill_if_needed(index_state, index);
 	}
-	else if (term_count > 0 && ItemPointerIsValid(ht_ctid))
+	else if (ItemPointerIsValid(ht_ctid))
 	{
 		/*
 		 * No shared state for this index -- nothing to do.
