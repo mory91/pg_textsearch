@@ -544,6 +544,28 @@ SELECT fs_check_q($q$
     LIMIT 10 FOR UPDATE
 $q$) AS lockrows_fallback_parity;
 
+-- Typed literals resolved to an index must retain variable-length metadata
+-- when the planner appends a hint and PostgreSQL copies the query value.
+SELECT fs_passes($q$
+    SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
+    ORDER BY body <@> 'common'::bm25query LIMIT 10
+$q$) AS typed_literal_passes;
+
+-- Planning a saved query must not depend on the last parsed statement.
+-- Force generic plans rather than relying on the custom-plan cost heuristic.
+SET plan_cache_mode = force_generic_plan;
+PREPARE fs_const_hint AS
+    SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
+    ORDER BY body <@> 'common'::bm25query LIMIT 10;
+SELECT 1 AS unrelated_statement;
+SELECT fs_passes('EXECUTE fs_const_hint') AS prepared_constant_passes;
+SELECT fs_passes('EXECUTE fs_const_hint') AS cached_constant_passes;
+DISCARD PLANS;
+SELECT 1 AS unrelated_statement;
+SELECT fs_passes('EXECUTE fs_const_hint') AS replanned_constant_passes;
+DEALLOCATE fs_const_hint;
+RESET plan_cache_mode;
+
 -- A generic plan's LIMIT is a PARAM_EXTERN and cannot be folded into the
 -- planner-carried query hint, so it uses normal backoff.
 -- The parser coerces a LIMIT to bigint, while an int parameter arrives

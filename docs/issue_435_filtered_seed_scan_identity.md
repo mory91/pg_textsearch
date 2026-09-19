@@ -55,7 +55,7 @@ it is not needed to address the motivating UNION ALL case.
 
 The hint is copied into each plan-local bm25query value, so identical
 queries on one index still carry independent seeds and cached plans retain
-their hints, subject to the outstanding review findings below. Query or
+their hints. Query or
 LIMIT expressions that remain nonconstant after planning use backoff.
 
 ## Handoff to the access method
@@ -131,16 +131,17 @@ identical scoring-pass counts and broadly similar latency. These cases
 use constant inputs and do not cover prepared-parameter fallback or
 plan copying.
 
-## Outstanding review findings
+## Plan copying and prepared queries
 
-The alternative is recorded for comparison and is not yet merge-ready:
+Resolved and hinted `bm25query` constants use `constlen = -1`, so
+PostgreSQL copies the complete variable-length datum, including its hint.
+Hint attachment inspects the actual plan and verifies the index access
+method, independently of the last statement's post-parse flag. This also
+covers saved queries planned after unrelated statements.
 
-- Attaching a larger query datum can retain a positive `Const.constlen`
-  from index resolution. A later copy can truncate the hint; variable-length
-  constants need `constlen = -1`.
-- Hint attachment is gated by a backend-global parse flag. Intervening
-  statements can clear it before a saved query is planned, so eligible
-  prepared queries can miss seeding.
+Regression cases check typed query literals, forced generic plans, cached
+plan reuse, and replanning after `DISCARD PLANS`, using scoring-pass counts.
+Unresolved generic LIMIT parameters still intentionally use backoff.
 
 ## Separate follow-ups
 

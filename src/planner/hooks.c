@@ -620,7 +620,7 @@ create_resolved_tpquery_const(Const *original, Oid index_oid)
 			original->consttype,
 			original->consttypmod,
 			original->constcollid,
-			VARSIZE(new_tpquery),
+			-1, /* bm25query is variable-length, including private hints */
 			PointerGetDatum(new_tpquery),
 			false,
 			false);
@@ -1968,10 +1968,19 @@ tp_attach_seed_hint(
 	int64		   k;
 	RangeTblEntry *rte;
 	Relation	   heap;
+	HeapTuple	   index_tuple;
+	Oid			   index_am;
 	double		   selectivity = 0.0;
 
 	if (list_length(scan->indexorderby) != 1 || scan->indexqual != NIL ||
 		!tp_limit_k(limit, &k) || scan->scan.scanrelid <= 0)
+		return;
+	index_tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(scan->indexid));
+	if (!HeapTupleIsValid(index_tuple))
+		return;
+	index_am = ((Form_pg_class)GETSTRUCT(index_tuple))->relam;
+	ReleaseSysCache(index_tuple);
+	if (index_am != oids->bm25_am_oid)
 		return;
 	rte = rt_fetch(scan->scan.scanrelid, rtable);
 	if (rte == NULL || !OidIsValid(rte->relid))
@@ -1995,6 +2004,9 @@ tp_attach_seed_hint(
 				TpQuery *query = (TpQuery *)DatumGetPointer(copy->constvalue);
 				TpQuery *hinted =
 						tpquery_copy_with_seed_hint(query, k, selectivity);
+				/* Copy the entire variable-length datum, including the hint.
+				 */
+				copy->constlen		   = -1;
 				copy->constvalue	   = PointerGetDatum(hinted);
 				((OpExpr *)expr)->args = list_delete_last(
 						((OpExpr *)expr)->args);
@@ -2142,10 +2154,12 @@ tp_planner_hook(
 		replace_scores_in_plan(result->planTree, &oid_cache);
 	}
 
-	/* SubPlans are kept separately from planTree.  The BM25 scan detector
-	 * above intentionally only examines the main tree, so hint attachment
-	 * must be gated by the parse-level flag instead. */
-	if (query_has_bm25_operators && result->planTree != NULL)
+	/*
+	 * Inspect the actual plan, including separately stored SubPlans.
+	 * A saved query can be planned after another statement has reset the
+	 * post-parse flag, so that flag cannot gate hint attachment.
+	 */
+	if (result->planTree != NULL)
 	{
 		ListCell *lc;
 
