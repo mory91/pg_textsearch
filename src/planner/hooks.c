@@ -1968,19 +1968,12 @@ tp_attach_seed_hint(
 	int64		   k;
 	RangeTblEntry *rte;
 	Relation	   heap;
-	HeapTuple	   index_tuple;
-	Oid			   index_am;
 	double		   selectivity = 0.0;
 
 	if (list_length(scan->indexorderby) != 1 || scan->indexqual != NIL ||
 		!tp_limit_k(limit, &k) || scan->scan.scanrelid <= 0)
 		return;
-	index_tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(scan->indexid));
-	if (!HeapTupleIsValid(index_tuple))
-		return;
-	index_am = ((Form_pg_class)GETSTRUCT(index_tuple))->relam;
-	ReleaseSysCache(index_tuple);
-	if (index_am != oids->bm25_am_oid)
+	if (get_rel_relam(scan->indexid) != oids->bm25_am_oid)
 		return;
 	rte = rt_fetch(scan->scan.scanrelid, rtable);
 	if (rte == NULL || !OidIsValid(rte->relid))
