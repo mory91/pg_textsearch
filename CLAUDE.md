@@ -157,7 +157,7 @@ make format-single FILE=path/to/file.c  # format specific file
 | `pg_textsearch.max_segment_size` | Conservative size budget for newly merged multi-source segments (1-4095MB) | 4095MB |
 | `pg_textsearch.background_compaction_schedule` | Default cron schedule captured by indexes entering managed background mode | `*/5 * * * *` |
 | `pg_textsearch.compress_segments` | Enable compression for new segment blocks | true |
-| `pg_textsearch.filtered_seed` | Seed the BM25 internal top-K from estimated filter selectivity. The existing planner hook attaches private query-value hints to direct `Limit -> IndexScan` pairs with constant query and LIMIT/OFFSET values. Each scan reads its own hint and applies the current GUCs; missing hints use the default and backoff. See `docs/issue_435_filtered_seed_scan_identity.md` for scope and prepared-plan behavior. | true |
+| `pg_textsearch.filtered_seed` | Seed the BM25 internal top-K from estimated filter selectivity. The existing planner hook attaches private query-value hints to direct `Limit -> IndexScan` pairs with constant query and LIMIT/OFFSET values. Each scan reads its own hint and applies the current GUCs; missing hints use the default and backoff. | true |
 | `pg_textsearch.filtered_seed_margin` | Seed = `ceil(margin * LIMIT / selectivity)`. Higher captures the true top-k in one scoring pass more often, at the cost of scoring deeper. Range [1, 1000] | 3.0 |
 | `pg_textsearch.debug_panic_after_spill_finalize` | Trigger PANIC after spill finalize (testing only, superuser-only) | false |
 | `pg_textsearch.memtable_cache_enabled` | Serve query reads from the in-memory memtable cache instead of the on-disk chain (chain remains source of truth; standbys always use the chain) | true |
