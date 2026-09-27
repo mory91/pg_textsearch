@@ -1993,17 +1993,24 @@ tp_attach_seed_hint(
 				((Const *)right)->consttype == oids->tpquery_type_oid &&
 				!((Const *)right)->constisnull)
 			{
-				Const	*copy  = copyObject((Const *)right);
-				TpQuery *query = (TpQuery *)DatumGetPointer(copy->constvalue);
+				Const	*original = (Const *)right;
+				TpQuery *query	  = (TpQuery *)DatumGetPointer(
+						   original->constvalue);
 				TpQuery *hinted =
 						tpquery_copy_with_seed_hint(query, k, selectivity);
-				/* Copy the entire variable-length datum, including the hint.
-				 */
-				copy->constlen		   = -1;
-				copy->constvalue	   = PointerGetDatum(hinted);
-				((OpExpr *)expr)->args = list_delete_last(
-						((OpExpr *)expr)->args);
-				((OpExpr *)expr)->args = lappend(((OpExpr *)expr)->args, copy);
+
+				Const *replacement = makeConst(
+						original->consttype,
+						original->consttypmod,
+						original->constcollid,
+						-1,
+						PointerGetDatum(hinted),
+						false,
+						false);
+
+				replacement->location = original->location;
+				/* Original nodes may be shared; their context owns them. */
+				lsecond(((OpExpr *)expr)->args) = replacement;
 			}
 		}
 	}

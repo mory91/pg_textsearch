@@ -1403,9 +1403,12 @@ tpquery_copy_with_seed_hint(TpQuery *tpquery, int64 k, double selectivity)
 	memcpy(copy, tpquery, old_size);
 	SET_VARSIZE(copy, new_size);
 	copy->flags |= TPQUERY_FLAG_SEED_HINT;
+
+	memset(&hint, 0, sizeof(hint));
 	hint.magic		 = TPQUERY_SEED_HINT_MAGIC;
 	hint.k			 = k;
 	hint.selectivity = selectivity;
+
 	memcpy((char *)copy + old_size, &hint, sizeof(hint));
 	return copy;
 }
