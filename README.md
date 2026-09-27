@@ -360,13 +360,26 @@ REINDEX INDEX docs_idx;
 ### Compaction
 
 With the default `inline` policy, compaction of levels that reach the configured
-threshold occurs as part of the write transaction that triggers the spill.
-These functions provide manual and scheduled control:
+threshold occurs synchronously in the write transaction that triggers the
+spill. Readers and other memtable writers can continue while merged output is
+built, because the long build holds no per-index LWLock. This is reader
+non-blocking, not foreground-writer non-blocking: the invoking writer still
+spends the time required to build and publish the merge. Compaction is
+skipped, and left to the next spill, when another session is reindexing,
+vacuuming, or compacting the index.
+
+These functions provide manual and scheduled control. They wait when another
+session holds index maintenance:
 
 ```sql
 SELECT bm25_force_merge('docs_idx');
 SELECT bm25_compact('docs_idx'::regclass);
 SELECT bm25_compact_step('docs_idx'::regclass);
+```
+
+These report compaction state without waiting for maintenance:
+
+```sql
 SELECT bm25_needs_compaction('docs_idx'::regclass);
 SELECT bm25_level_counts('docs_idx'::regclass);
 ```
@@ -378,8 +391,8 @@ processes at most one pass.
 
 - Long merge work checks for cancellation, but published replacements remain
   physical and are not undone by `ROLLBACK`.
-- Drive maintenance loops from `bm25_compact_step()`'s return value, not
-  `bm25_needs_compaction()`, which is advisory.
+- `bm25_needs_compaction()` reports whether `bm25_compact_step()` would run a
+  pass, so either can drive a maintenance loop.
 - Mutating functions require index ownership and do not operate on partitioned
   parent indexes or during recovery.
 
@@ -387,7 +400,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md#spill-and-compaction) for sizing,
 publication, locking, and page-reclaim details.
 
 Hot standbys serving queries must set `hot_standby_feedback = on` so active
-snapshots delay physical page reuse on the primary.
+snapshots delay physical page reuse on the primary. If a standby disconnects
+while an old snapshot remains active, stock PostgreSQL recovery-conflict WAL
+cancels that snapshot before reclaimed segment pages can be reused on replay.
 
 ### Settings
 
@@ -476,7 +491,8 @@ LIMIT 10;
 
 ### Background Compaction
 
-The default `inline` policy compacts synchronously during memtable spills.
+The default `inline` policy compacts during memtable spills, skipping the pass
+when another session is using or maintaining the index.
 Managed `background` mode uses [pg_durable](https://github.com/microsoft/pg_durable)
 0.2.8 or newer rather than a built-in worker. pg_durable must be preloaded,
 initialized in the current database, and granted to the index owner. The owner
