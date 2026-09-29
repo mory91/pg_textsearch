@@ -3,8 +3,8 @@
 #
 # Measures what pg_textsearch.filtered_seed is worth on filtered top-k
 # queries -- WHERE <filter> ORDER BY <score> LIMIT k -- by toggling the
-# GUC over identical data and queries.  Results are identical either
-# way, so the metrics are latency and scoring passes.
+# GUC over identical data and queries. Metrics are latency and scoring
+# passes; result parity is covered by the filtered_seed regression.
 #
 # The union2/union3 shapes are the #435 case: several BM25 scans of one
 # index in one statement.  To see what #435 bought, run this on main and
@@ -16,8 +16,8 @@
 #
 # Arguments:
 #   ndocs: corpus size. Default 200000.  Below ~100k the planner may
-#          prefer a seq scan and sort, and cells with no BM25 scan are
-#          dropped with a warning.
+#          prefer a seq scan and sort. Cells without a BM25 scan in
+#          every arm are dropped with a warning.
 #
 # Examples:
 #   ./run_filtered_seed.sh
@@ -29,7 +29,7 @@
 #   - results/filtered_seed_<timestamp>.txt with raw output
 #   - results/filtered_seed_<timestamp>.json with parsed metrics
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NDOCS="${1:-200000}"
@@ -57,7 +57,7 @@ if ! grep -q '^FSB_RESULT:' "$OUTPUT_FILE"; then
 fi
 
 # Warn loudly rather than let a dropped cell pass unnoticed.
-if grep -q 'no BM25 scan for shape=' "$OUTPUT_FILE"; then
+if grep -q 'BM25 scan count mismatch for shape=' "$OUTPUT_FILE"; then
     echo ""
     echo "WARNING: some cells were dropped because the planner chose a"
     echo "         seq scan instead of the BM25 index scan. Try a larger"

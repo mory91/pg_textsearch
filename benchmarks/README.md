@@ -48,9 +48,10 @@ Performance benchmarks for the pg_textsearch BM25 full-text search extension.
   unseeded scan pays executor backoff re-drives
 - **Script:** `./run_filtered_seed.sh [ndocs]`
 - **Time:** ~10 seconds at the default size; no download needed
-- **Method:** Toggles the GUC over identical data and queries, so the
-  results are byte-identical and only depth changes. Reports median
-  latency and, where `bm25_debug_scoring_passes` exists, scoring passes
+- **Method:** Toggles the GUC over identical data and queries. Reports
+  median latency and, where `bm25_debug_scoring_passes` exists, scoring
+  passes. Drops cells unless every arm uses the BM25 index; result
+  parity is covered separately by the `filtered_seed` regression
 - **Note:** Compare only the *seed on* columns across versions. The
   *seed off* baseline is not stable across the #435 change, because the
   `LIMIT` binding became per-scan even with seeding disabled

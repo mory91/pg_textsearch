@@ -564,6 +564,22 @@ DISCARD PLANS;
 SELECT 1 AS unrelated_statement;
 SELECT fs_passes('EXECUTE fs_const_hint') AS replanned_constant_passes;
 DEALLOCATE fs_const_hint;
+
+-- A runtime query operand cannot carry a hint. The cached plan must use
+-- default-limit backoff and read the new query value on each execution.
+PREPARE fs_query(bm25query) AS
+SELECT array_agg(id ORDER BY id) FROM (
+    SELECT id FROM fs_docs WHERE facet_id = 6 AND id % 7 = 3
+    ORDER BY body <@> $1 LIMIT 10) s;
+SELECT fs_plan_shape(
+    'EXECUTE fs_query(to_bm25query(''common'', ''fs_docs_idx''))'
+) AS runtime_query_shape;
+SELECT fs_passes(
+    'EXECUTE fs_query(to_bm25query(''common'', ''fs_docs_idx''))'
+) AS runtime_query_passes;
+EXECUTE fs_query(to_bm25query('common', 'fs_docs_idx'));
+EXECUTE fs_query(to_bm25query('beta', 'fs_docs_idx'));
+DEALLOCATE fs_query;
 RESET plan_cache_mode;
 
 -- A generic plan's LIMIT is a PARAM_EXTERN and cannot be folded into the

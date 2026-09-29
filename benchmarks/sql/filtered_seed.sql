@@ -31,8 +31,8 @@
 -- k, the rest at default_limit" on an old one.  Those are different
 -- amounts of work, and neither is the thing being measured.
 --
--- Results are identical either way -- seeding changes scan depth, not
--- which rows win -- so the metrics are latency and scoring passes.
+-- Metrics are latency and scoring passes. Result parity is covered by
+-- the filtered_seed regression, not by this timing harness.
 -- bm25_debug_scoring_passes counts passes: a well-seeded scan costs
 -- exactly one, and each backoff re-drive adds another.
 --
@@ -121,9 +121,8 @@ END;
 $$;
 
 -- How many BM25 index scans of fsb_idx the plan actually contains.
--- Zero means the planner chose a seq scan and sort, and the cell says
--- nothing about seeding.  Read from EXPLAIN rather than inferred from
--- the pass counter, so the check works on builds without the counter.
+-- Every arm must use the index. Read from EXPLAIN rather than inferred
+-- from the pass counter, so this works on builds without the counter.
 CREATE FUNCTION fsb_scan_count(q text) RETURNS int
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -181,16 +180,18 @@ DECLARE
     on_ms  numeric;
     on_p   bigint;
     scans  int;
+    expected_scans int := CASE shape
+        WHEN 'single' THEN 1 WHEN 'union2' THEN 2 WHEN 'union3' THEN 3 END;
 BEGIN
-    /*
-     * Loud, because a plausible-looking latency pair from a plan that
-     * has no BM25 scan in it is worse than no row at all.
-     */
+    IF expected_scans IS NULL THEN
+        RAISE EXCEPTION 'unknown benchmark shape: %', shape;
+    END IF;
+
     scans := fsb_scan_count(q);
-    IF scans = 0 THEN
-        RAISE WARNING 'no BM25 scan for shape=% sel=% limit=%; '
-                      'planner chose another plan, cell dropped',
-                      shape, sel, lim;
+    IF scans <> expected_scans THEN
+        RAISE WARNING 'BM25 scan count mismatch for shape=% sel=% limit=%; '
+                      'expected %, got %, cell dropped',
+                      shape, sel, lim, expected_scans, scans;
         RETURN;
     END IF;
 
