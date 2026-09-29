@@ -68,12 +68,14 @@
 typedef struct TpBuildProgress
 {
 	struct TpBuildProgress *previous;
+	const void			   *owner;
 	int						partition_count;
 	uint64					total_docs;
 	uint64					total_len;
 } TpBuildProgress;
 
-static TpBuildProgress *build_progress = NULL;
+static TpBuildProgress *build_progress		 = NULL;
+static const void	   *build_progress_owner = NULL;
 
 typedef struct TpPreparedSpill
 {
@@ -83,7 +85,15 @@ typedef struct TpPreparedSpill
 	TpDocMapBuilder *docmap;
 	uint64			 docs_delta;
 	uint64			 len_delta;
+	BlockNumber		 root;
+	bool			 published;
 } TpPreparedSpill;
+
+void
+tp_build_progress_set_owner(const void *owner)
+{
+	build_progress_owner = owner;
+}
 
 void
 tp_build_progress_begin(void)
@@ -96,6 +106,7 @@ tp_build_progress_begin(void)
 	MemoryContextSwitchTo(old_context);
 
 	progress->previous = build_progress;
+	progress->owner	   = build_progress_owner;
 	build_progress	   = progress;
 }
 
@@ -108,7 +119,14 @@ tp_build_progress_end(void)
 	if (progress == NULL)
 		return;
 
+	Assert(progress->owner == build_progress_owner);
 	build_progress = progress->previous;
+
+	if (progress->partition_count == 0)
+	{
+		pfree(progress);
+		return;
+	}
 
 	if (progress->total_docs > 0)
 		avg_len = (double)progress->total_len / (double)progress->total_docs;
@@ -139,8 +157,39 @@ tp_build_progress_abort(void)
 	if (progress == NULL)
 		return;
 
+	Assert(progress->owner == build_progress_owner);
 	build_progress = progress->previous;
 	pfree(progress);
+}
+
+static TpBuildProgress *
+current_build_progress(void)
+{
+	if (build_progress != NULL &&
+		build_progress->owner == build_progress_owner)
+		return build_progress;
+
+	return NULL;
+}
+
+static void
+record_or_report_build_completion(
+		TpBuildProgress *progress, uint64 total_docs, uint64 total_len)
+{
+	if (progress != NULL)
+	{
+		progress->total_docs += total_docs;
+		progress->total_len += total_len;
+		progress->partition_count++;
+	}
+	else
+	{
+		elog(NOTICE,
+			 "BM25 index build completed: " UINT64_FORMAT
+			 " documents, avg_length=%.2f",
+			 total_docs,
+			 total_docs > 0 ? (float4)(total_len / (double)total_docs) : 0.0);
+	}
 }
 
 /*
@@ -164,13 +213,28 @@ tp_buildphasename(int64 phase)
 	}
 }
 
+static void
+tp_check_spill_capacity(Relation index_rel, uint32 segment_capacity)
+{
+	TpIndexMetaPage metap		= tp_get_metapage(index_rel);
+	bool			at_capacity = metap->level_counts[0] >= segment_capacity;
+
+	pfree(metap);
+	if (at_capacity)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("bm25 segment count limit reached at level 0")));
+}
+
 static bool
 tp_prepare_spill(
 		TpLocalIndexState *index_state,
 		Relation		   index_rel,
-		TpPreparedSpill	  *spill)
+		TpPreparedSpill	  *spill,
+		uint32			   segment_capacity)
 {
 	memset(spill, 0, sizeof(*spill));
+	spill->root = InvalidBlockNumber;
 
 	/*
 	 * Open a chain source.  This idempotently re-acquires the
@@ -182,6 +246,8 @@ tp_prepare_spill(
 			tp_memtable_chain_source_create(index_state, index_rel, NULL, 0);
 	if (spill->source == NULL)
 		return false;
+
+	tp_check_spill_capacity(index_rel, segment_capacity);
 
 	spill->docs_delta = (uint64)spill->source->total_docs;
 	spill->len_delta  = (uint64)spill->source->total_len;
@@ -197,30 +263,22 @@ tp_prepare_spill(
 }
 
 static void
-tp_finish_spill(
+tp_build_prepared_spill(Relation index_rel, TpPreparedSpill *spill)
+{
+	Assert(!BlockNumberIsValid(spill->root));
+	spill->root = tp_write_segment(
+			index_rel, spill->terms, spill->num_terms, spill->docmap);
+}
+
+static void
+tp_publish_prepared_spill(
 		TpLocalIndexState *index_state,
 		Relation		   index_rel,
 		TpPreparedSpill	  *spill,
 		BlockNumber		  *out_segment_root,
 		uint32			   segment_capacity)
 {
-	BlockNumber root;
-
-	{
-		TpIndexMetaPage metap = tp_get_metapage(index_rel);
-
-		if (metap->level_counts[0] >= segment_capacity)
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("bm25 segment count limit reached at level 0")));
-		pfree(metap);
-	}
-
-	root = tp_write_segment(
-			index_rel, spill->terms, spill->num_terms, spill->docmap);
-
-	if (out_segment_root != NULL)
-		*out_segment_root = root;
+	tp_check_spill_capacity(index_rel, segment_capacity);
 
 	/*
 	 * Finalize first, then mark dead - crash-safe ordering.
@@ -244,16 +302,14 @@ tp_finish_spill(
 		chain_head = metap->memtable_head_blkno;
 		pfree(metap);
 
-		TP_INJECTION_POINT(TP_INJECTION_SPILL_BEFORE_FINALIZE);
 		tp_spill_finalize(
 				index_state,
 				index_rel,
-				root,
+				spill->root,
 				spill->docs_delta,
 				spill->len_delta,
-				segment_capacity);
-
-		TP_INJECTION_POINT(TP_INJECTION_AFTER_SPILL_FINALIZE);
+				segment_capacity,
+				&spill->published);
 
 		/*
 		 * Sample only after the unpublication WAL is inserted.  Every
@@ -265,27 +321,57 @@ tp_finish_spill(
 			tp_memtable_mark_chain_dead(index_rel, chain_head, horizon);
 	}
 
-	/* Free dictionary + docmap (chain source no longer needed). */
-	tp_free_dictionary(spill->terms, spill->num_terms);
-	tp_docmap_destroy(spill->docmap);
-	tp_source_close(spill->source);
-
-	/*
-	 * Reset chain_page_count: the chain is empty after
-	 * tp_spill_finalize.  Caller holds LW_EXCLUSIVE so no
-	 * concurrent insert can have bumped this since the
-	 * pre-spill chain extension was published.
-	 */
-	pg_atomic_write_u32(&index_state->shared->chain_page_count, 0);
+	if (out_segment_root != NULL)
+		*out_segment_root = spill->root;
 }
 
-bool
+static void
+tp_cleanup_prepared_spill(Relation index_rel, TpPreparedSpill *spill)
+{
+	if (BlockNumberIsValid(spill->root) && !spill->published)
+		tp_discard_unpublished_segment(index_rel, spill->root);
+
+	if (spill->terms != NULL)
+		tp_free_dictionary(spill->terms, spill->num_terms);
+	if (spill->docmap != NULL)
+		tp_docmap_destroy(spill->docmap);
+	if (spill->source != NULL)
+		tp_source_close(spill->source);
+
+	spill->source = NULL;
+	spill->terms  = NULL;
+	spill->docmap = NULL;
+	spill->root	  = InvalidBlockNumber;
+}
+
+static bool
+tp_acquire_spill_index_lock(TpLocalIndexState *index_state, bool nowait)
+{
+	if (nowait)
+		return tp_try_acquire_index_lock(index_state, LW_EXCLUSIVE);
+	tp_acquire_index_lock(index_state, LW_EXCLUSIVE);
+	return true;
+}
+
+/*
+ * Caller holds publication ShareLock and the exclusive writer/spill gate,
+ * but not the per-index lock. Return the published root before compaction.
+ */
+static bool
 tp_do_spill(
 		TpLocalIndexState *index_state,
 		Relation		   index_rel,
-		BlockNumber		  *out_segment_root)
+		BlockNumber		  *out_segment_root,
+		uint32			   segment_capacity,
+		bool			   nowait)
 {
-	TpPreparedSpill spill;
+	TpPreparedSpill *spill;
+	volatile bool	 success = false;
+
+	Assert(!index_state->lock_held);
+	Assert(!LWLockHeldByMe(&index_state->shared->lock));
+	Assert(LWLockHeldByMeInMode(
+			&index_state->shared->memtable_write_lock, LW_EXCLUSIVE));
 
 	if (out_segment_root != NULL)
 		*out_segment_root = InvalidBlockNumber;
@@ -298,17 +384,45 @@ tp_do_spill(
 	if (RecoveryInProgress())
 		return false;
 
-	if (!tp_prepare_spill(index_state, index_rel, &spill))
-		return false;
+	spill		= palloc0(sizeof(*spill));
+	spill->root = InvalidBlockNumber;
+	PG_TRY();
+	{
+		if (tp_acquire_spill_index_lock(index_state, nowait))
+		{
+			bool prepared = tp_prepare_spill(
+					index_state, index_rel, spill, segment_capacity);
 
-	tp_finish_spill(
-			index_state,
-			index_rel,
-			&spill,
-			out_segment_root,
-			tp_injected_segment_count_limit());
+			tp_release_index_lock(index_state);
+			if (prepared)
+			{
+				tp_build_prepared_spill(index_rel, spill);
+				TP_INJECTION_POINT(TP_INJECTION_SPILL_BEFORE_FINALIZE);
+				CHECK_FOR_INTERRUPTS();
+				if (tp_acquire_spill_index_lock(index_state, nowait))
+				{
+					tp_publish_prepared_spill(
+							index_state,
+							index_rel,
+							spill,
+							out_segment_root,
+							segment_capacity);
+					tp_release_index_lock(index_state);
+					success = true;
+				}
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (index_state->lock_held)
+			tp_release_index_lock(index_state);
+		tp_cleanup_prepared_spill(index_rel, spill);
+	}
+	PG_END_TRY();
 
-	return true;
+	pfree(spill);
+	return success;
 }
 
 /*
@@ -458,8 +572,8 @@ tp_make_room_for_spill(
  * even at a full level 0, where it reports the capacity limit.  VACUUM needs
  * this because it identifies dead documents from published segments alone.
  *
- * TP_SPILL_NOWAIT makes the spill skip rather than block, so the
- * shutdown hook never waits on a busy index.
+ * TP_SPILL_NOWAIT skips busy publication, writer-gate, and per-index locks.
+ * Buffer, WAL, and I/O work may still wait after admission.
  */
 static bool
 tp_spill_memtable_if_needed_internal(
@@ -468,13 +582,18 @@ tp_spill_memtable_if_needed_internal(
 		uint32			   min_pages,
 		int				   flags)
 {
-	bool spilled = false;
+	bool		  spilled		= false;
+	volatile bool gate_acquired = false;
 
 	/* Standby is read-only; spill is primary-only. */
 	if (RecoveryInProgress())
 		return false;
 
 	if (!index_state || !index_state->shared)
+		return false;
+
+	if (!tp_reseed_chain_page_count_if_needed(
+				index_state, index, (flags & TP_SPILL_NOWAIT) != 0))
 		return false;
 
 	if (pg_atomic_read_u32(&index_state->shared->chain_page_count) < min_pages)
@@ -498,25 +617,31 @@ tp_spill_memtable_if_needed_internal(
 
 	PG_TRY();
 	{
-		bool acquired;
-
 		if (flags & TP_SPILL_NOWAIT)
-			acquired = tp_try_acquire_index_lock(index_state, LW_EXCLUSIVE);
+			gate_acquired = tp_try_acquire_memtable_write_lock(
+					index_state, LW_EXCLUSIVE);
 		else
 		{
-			tp_acquire_index_lock(index_state, LW_EXCLUSIVE);
-			acquired = true;
+			tp_acquire_memtable_write_lock(index_state, LW_EXCLUSIVE);
+			gate_acquired = true;
 		}
 
-		if (acquired &&
+		if (gate_acquired &&
 			pg_atomic_read_u32(&index_state->shared->chain_page_count) >=
 					min_pages)
-			spilled = tp_do_spill(index_state, index, NULL);
+			spilled = tp_do_spill(
+					index_state,
+					index,
+					NULL,
+					tp_injected_segment_count_limit(),
+					(flags & TP_SPILL_NOWAIT) != 0);
 	}
 	PG_FINALLY();
 	{
 		if (index_state->lock_held)
 			tp_release_index_lock(index_state);
+		if (gate_acquired)
+			tp_release_memtable_write_lock(index_state);
 		tp_compaction_publication_unlock(index, ShareLock);
 	}
 	PG_END_TRY();
@@ -741,7 +866,7 @@ tp_spill_memtable(PG_FUNCTION_ARGS)
 
 	/* Keep spill publication outside compaction's prepare/publish window. */
 	tp_compaction_publication_lock(index_rel, ShareLock);
-	tp_acquire_index_lock(index_state, LW_EXCLUSIVE);
+	tp_acquire_memtable_write_lock(index_state, LW_EXCLUSIVE);
 	PG_TRY();
 	{
 		/*
@@ -750,12 +875,18 @@ tp_spill_memtable(PG_FUNCTION_ARGS)
 		 * immediately folds that segment into L1.
 		 */
 		segment_root = InvalidBlockNumber;
-		spilled		 = tp_do_spill(index_state, index_rel, &segment_root);
+		spilled		 = tp_do_spill(
+				 index_state,
+				 index_rel,
+				 &segment_root,
+				 tp_injected_segment_count_limit(),
+				 false);
 	}
 	PG_FINALLY();
 	{
 		if (index_state->lock_held)
 			tp_release_index_lock(index_state);
+		tp_release_memtable_write_lock(index_state);
 		tp_compaction_publication_unlock(index_rel, ShareLock);
 	}
 	PG_END_TRY();
@@ -821,8 +952,8 @@ tp_force_merge(PG_FUNCTION_ARGS)
 	 */
 	{
 		TpLocalIndexState *index_state = tp_get_local_index_state(index_oid);
-		TpPreparedSpill	   spill;
-		bool			   has_memtable;
+		volatile bool	   publication_locked = false;
+		volatile bool	   gate_locked		  = false;
 
 		if (index_state == NULL)
 			ereport(ERROR,
@@ -834,12 +965,16 @@ tp_force_merge(PG_FUNCTION_ARGS)
 		tp_compaction_lock(index_rel);
 		PG_TRY();
 		{
-			tp_acquire_index_lock(index_state, LW_EXCLUSIVE);
-			has_memtable = tp_prepare_spill(index_state, index_rel, &spill);
-			if (has_memtable)
-				tp_finish_spill(
-						index_state, index_rel, &spill, NULL, PG_UINT16_MAX);
-			tp_release_index_lock(index_state);
+			tp_compaction_publication_lock(index_rel, ShareLock);
+			publication_locked = true;
+			tp_acquire_memtable_write_lock(index_state, LW_EXCLUSIVE);
+			gate_locked = true;
+			(void)tp_do_spill(
+					index_state, index_rel, NULL, PG_UINT16_MAX, false);
+			tp_release_memtable_write_lock(index_state);
+			gate_locked = false;
+			tp_compaction_publication_unlock(index_rel, ShareLock);
+			publication_locked = false;
 
 			tp_force_compact(index_state, index_rel);
 
@@ -850,6 +985,10 @@ tp_force_merge(PG_FUNCTION_ARGS)
 		{
 			if (index_state->lock_held)
 				tp_release_index_lock(index_state);
+			if (gate_locked)
+				tp_release_memtable_write_lock(index_state);
+			if (publication_locked)
+				tp_compaction_publication_unlock(index_rel, ShareLock);
 			tp_compaction_unlock(index_rel);
 		}
 		PG_END_TRY();
@@ -1485,13 +1624,17 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	uint64			   total_docs = 0;
 	uint64			   total_len  = 0;
 	TpLocalIndexState *index_state;
+	TpBuildProgress	  *progress;
+	TpLocalIndexState *build_state;
+	SubTransactionId   index_create_subid;
 	bool			   is_text_array;
 
 	tp_check_bm25_build_allowed(heap);
 	tp_rls_note_bm25_build();
 
 	/* Show "started" for first partition only (suppresses duplicates) */
-	if (build_progress == NULL || build_progress->partition_count == 0)
+	progress = current_build_progress();
+	if (progress == NULL || progress->partition_count == 0)
 		elog(NOTICE,
 			 "BM25 index build started for relation %s",
 			 RelationGetRelationName(index));
@@ -1525,7 +1668,7 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 			index, &text_config_name, &text_config_oid, &k1, &b);
 
 	/* Log configuration (only for first partition when active) */
-	if (build_progress == NULL || build_progress->partition_count == 0)
+	if (progress == NULL || progress->partition_count == 0)
 	{
 		if (text_config_name)
 			elog(NOTICE,
@@ -1533,6 +1676,10 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 				 text_config_name);
 		elog(NOTICE, "Using index options: k1=%.2f, b=%.2f", k1, b);
 	}
+
+	index_create_subid = index->rd_createSubid;
+	build_state		   = tp_create_build_index_state(
+			   index->rd_id, heap->rd_id, index_create_subid);
 
 	/* Initialize metapage */
 	tp_build_init_metapage(index, text_config_oid, k1, b);
@@ -1587,8 +1734,7 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 			 * Warn if table is very large but parallelism is limited.
 			 * Suppress during partitioned builds to reduce noise.
 			 */
-			if (build_progress == NULL &&
-				reltuples >= TP_WARN_FEW_WORKERS_TUPLES &&
+			if (progress == NULL && reltuples >= TP_WARN_FEW_WORKERS_TUPLES &&
 				nworkers <= TP_WARN_FEW_WORKERS_MIN)
 			{
 				elog(NOTICE,
@@ -1614,52 +1760,35 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 					nworkers);
 
 			/*
-			 * Create shared index state for runtime queries.
-			 *
-			 * The parallel build writes segments and updates
-			 * the metapage, but does not create the in-memory
-			 * shared state that INSERT and SELECT need.
-			 * Without this, the first post-build access falls
-			 * through to tp_rebuild_index_from_disk() (the
-			 * first-access bootstrap path), which can race
-			 * with concurrent backends touching the same
-			 * index and re-creating its registry entry.
-			 *
-			 * By creating the state here — the same backend
-			 * that ran the build — we ensure the registry
-			 * entry and local cache are ready before the
-			 * CREATE INDEX transaction commits.
+			 * Parallel workers kept all build data in DSM/BufFiles.
+			 * Invalidate the stable runtime cache only after the new
+			 * index relfilenode is complete.
 			 */
 			{
 				Buffer			metabuf;
 				Page			mpage;
 				TpIndexMetaPage metap;
 
-				(void)tp_create_shared_index_state(
-						RelationGetRelid(index),
-						RelationGetRelid(heap),
-						/* reuse_if_exists */ false);
+				tp_finalize_build_mode(build_state);
 
-				if (build_progress != NULL)
-				{
-					metabuf = ReadBuffer(index, TP_METAPAGE_BLKNO);
-					LockBuffer(metabuf, BUFFER_LOCK_SHARE);
-					mpage = BufferGetPage(metabuf);
-					metap = (TpIndexMetaPage)PageGetContents(mpage);
+				metabuf = ReadBuffer(index, TP_METAPAGE_BLKNO);
+				LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+				mpage = BufferGetPage(metabuf);
+				metap = (TpIndexMetaPage)PageGetContents(mpage);
 
-					build_progress->total_docs += (uint64)metap->total_docs;
-					build_progress->total_len += (uint64)metap->total_len;
-					build_progress->partition_count++;
+				record_or_report_build_completion(
+						progress,
+						(uint64)metap->total_docs,
+						(uint64)metap->total_len);
 
-					UnlockReleaseBuffer(metabuf);
-				}
+				UnlockReleaseBuffer(metabuf);
 			}
 
 			return par_result;
 		}
 
-		if (build_progress == NULL &&
-			reltuples >= TP_WARN_NO_PARALLEL_TUPLES && nworkers == 0)
+		if (progress == NULL && reltuples >= TP_WARN_NO_PARALLEL_TUPLES &&
+			nworkers == 0)
 		{
 			/*
 			 * Large table but no parallel workers available.
@@ -1690,14 +1819,7 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		Size				 budget;
 		double				 reltuples;
 
-		/*
-		 * Still create build index state for:
-		 * - Per-index LWLock infrastructure
-		 * - Post-build transition to runtime mode
-		 * - Shared state initialization for runtime queries
-		 */
-		index_state = tp_create_build_index_state(
-				RelationGetRelid(index), RelationGetRelid(heap));
+		index_state = build_state;
 		tp_acquire_index_lock(index_state, LW_EXCLUSIVE);
 
 		/* Budget: maintenance_work_mem (in KB) -> bytes */
@@ -1796,22 +1918,7 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		result->heap_tuples	 = reltuples;
 		result->index_tuples = total_docs;
 
-		if (build_progress != NULL)
-		{
-			/* Accumulate stats for aggregated summary */
-			build_progress->total_docs += total_docs;
-			build_progress->total_len += total_len;
-			build_progress->partition_count++;
-		}
-		else
-		{
-			elog(NOTICE,
-				 "BM25 index build completed: " UINT64_FORMAT
-				 " documents, avg_length=%.2f",
-				 total_docs,
-				 total_docs > 0 ? (float4)(total_len / (double)total_docs)
-								: 0.0);
-		}
+		record_or_report_build_completion(progress, total_docs, total_len);
 
 		/*
 		 * Release the per-index lock before finalizing.
@@ -1821,8 +1928,8 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		tp_release_index_lock(index_state);
 
 		/*
-		 * Finalize build mode: destroy private DSA and
-		 * transition to global DSA for runtime operation.
+		 * The build output is complete; invalidate the derived runtime
+		 * cache in place without replacing its stable allocation.
 		 */
 		tp_finalize_build_mode(index_state);
 
@@ -2016,6 +2123,7 @@ tp_insert(
 		 * on the tail.  Spill holds LW_EXCLUSIVE to fence
 		 * inserts during the chain-reset step.
 		 */
+		tp_acquire_memtable_write_lock(index_state, LW_SHARED);
 		tp_acquire_index_lock(index_state, LW_SHARED);
 
 		/* Validate TID before appending to the chain */
@@ -2035,6 +2143,7 @@ tp_insert(
 
 		/* Release lock before spill check */
 		tp_release_index_lock(index_state);
+		tp_release_memtable_write_lock(index_state);
 
 		/*
 		 * Auto-spill check runs outside the lock — may

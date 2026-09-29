@@ -93,7 +93,7 @@ PG_CPPFLAGS += -Wno-unknown-warning-option -Wno-clobbered -Wno-packed-not-aligne
 # PG_CPPFLAGS += -DDEBUG_DUMP_INDEX
 
 # Test configuration
-REGRESS = abort aerodocs basic binary_io bmw bmw_skip_advance boolean_queries bulk_load cache_apply cache_memory_cap cache_source cache_spill catalog_stats chain_source compaction compaction_request compression concurrent_build coverage deletion vacuum vacuum_bitmap vacuum_extended vacuum_rebuild dropped empty explicit_index expression_index filtered_seed force_merge implicit index inheritance large_documents limits lock manyterms memory memtable_append memtable_page memtable_spill memtable_spill_dead memtable_reclaim merge mixed parallel_build parallel_bmw partitioned partitioned_many partial_index pgstats queries quoted_identifiers rescan rls schema scoring1 scoring2 scoring3 scoring4 scoring5 scoring6 security security_acl segment segment_integrity segment_reclaim tombstone_reuse tombstone_recover strings temp_table text_array text_config unsupported updates vector vector_v1_rejected unlogged_index wand
+REGRESS = abort aerodocs basic binary_io bmw bmw_skip_advance boolean_queries build_progress bulk_load cache_apply cache_memory_cap cache_source cache_spill catalog_stats chain_source compaction compaction_request compression concurrent_build coverage deletion vacuum vacuum_bitmap vacuum_extended vacuum_rebuild dropped empty explicit_index expression_index filtered_seed force_merge implicit index inheritance large_documents limits lock manyterms memory memtable_append memtable_page memtable_spill memtable_spill_dead memtable_reclaim merge mixed parallel_build parallel_bmw partitioned partitioned_many partial_index pgstats queries quoted_identifiers rescan rls schema scoring1 scoring2 scoring3 scoring4 scoring5 scoring6 security security_acl segment segment_integrity segment_reclaim tombstone_reuse tombstone_recover strings temp_table text_array text_config unsupported updates vector vector_v1_rejected unlogged_index wand
 INJECTION_REGRESS = merge_injection compaction_injection \
 	compaction_error_injection \
 	force_merge_injection segment_reclaim_injection \
@@ -128,6 +128,7 @@ test-injection-shell:
 	@cd test/scripts && ./inline_compaction_locking.sh injection
 	@cd test/scripts && ./crash_safety_spill.sh
 	@cd test/scripts && ./nonblocking_compaction.sh
+	@cd test/scripts && ./nonblocking_spill.sh
 	@cd test/scripts && ./compaction_recovery.sh
 	@cd test/scripts && ./parallel_vacuum.sh injection
 	@cd test/scripts && ./standby_reclaim.sh
@@ -196,6 +197,9 @@ test-rls-locking:
 
 test-nonblocking-compaction:
 	@cd test/scripts && ./nonblocking_compaction.sh
+
+test-nonblocking-spill:
+	@cd test/scripts && ./nonblocking_spill.sh
 
 test-standalone-snapshot:
 	@cd test/scripts && ./standalone_snapshot.sh
@@ -286,7 +290,11 @@ test-reindex:
 	@echo "Running multi-backend reindex regression tests (issue #390)..."
 	@cd test/scripts && ./multi_backend_reindex.sh
 
-test-shell: test-concurrency test-recovery test-segment test-cic test-multi-index test-reindex
+test-cross-database-registry:
+	@echo "Running cross-database registry regression tests (issue #464)..."
+	@cd test/scripts && ./cross_database_registry.sh
+
+test-shell: test-concurrency test-recovery test-segment test-cic test-multi-index test-reindex test-cross-database-registry
 	@echo "All shell-based tests completed"
 
 test-all: test test-shell test-replication
@@ -426,7 +434,7 @@ help:
 	@echo "  make clean        - Clean build artifacts and test directories"
 	@echo ""
 	@echo "Testing targets:"
-	@echo "  make test         - Run source guard and SQL regression tests"
+	@echo "  make test         - Run SQL regression tests"
 	@echo "  make installcheck - Run SQL regression tests"
 	@echo "  make test-local   - Run tests with dedicated PostgreSQL instance"
 	@echo "  make test-all     - Run SQL, default shell, and replication tests"
@@ -440,6 +448,7 @@ help:
 	@echo "  make test-chinese     - Run Chinese tokenization test (needs zhparser)"
 	@echo "  make test-reindex     - Run multi-backend reindex regression tests (issue #390)"
 	@echo "  make test-durable     - Run managed pg_durable compaction tests"
+	@echo "  make test-cross-database-registry - Run issue #464 registry regression"
 	@echo "  make expected     - Generate expected output files from test results"
 	@echo ""
 	@echo "Code formatting targets:"
@@ -469,9 +478,11 @@ help:
 	test-injection-sql test-injection-shell install-test-injection \
 	clean-test-dirs installcheck test-rls-locking test-concurrency \
 	test-standalone-snapshot test-nonblocking-compaction \
+	test-nonblocking-spill \
 	test-recovery test-segment test-stress test-cic test-chinese \
 	test-replication test-replication-extended \
 	test-logical-replication test-multi-index test-reindex \
+	test-cross-database-registry \
 	test-shell test-all expected lint-format format format-check \
 	format-diff format-single coverage coverage-build coverage-clean \
 	coverage-report help

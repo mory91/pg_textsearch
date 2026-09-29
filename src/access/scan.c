@@ -660,7 +660,7 @@ tp_gettuple(IndexScanDesc scan, ScanDirection dir)
 		/* Convert BM25 score to Datum (ensure negative for ASC sort) */
 		raw_score				 = so->result_scores[so->current_pos];
 		bm25_score				 = (raw_score > 0) ? -raw_score : raw_score;
-		scan->xs_orderbyvals[0]	 = Float4GetDatum(bm25_score);
+		scan->xs_orderbyvals[0]	 = Float8GetDatum((float8)bm25_score);
 		scan->xs_orderbynulls[0] = false;
 
 		/* Log BM25 score if enabled */

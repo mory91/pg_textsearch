@@ -151,6 +151,7 @@ int tp_tokenize_text(
 		int	   *term_count_out);
 
 /* Build progress tracking for partitioned tables */
+void tp_build_progress_set_owner(const void *owner);
 void tp_build_progress_begin(void);
 void tp_build_progress_end(void);
 void tp_build_progress_abort(void);
@@ -222,21 +223,6 @@ int tp_reclaim_dead_memtable_pages(Relation indexrel, Relation heaprel);
  * horizon — NULL can only over-retain, never free too early.
  */
 extern FullTransactionId tp_reclaim_horizon(Relation heaprel);
-
-/*
- * Spill the current index's memtable to a disk segment.
- * Returns true if a segment was written or chain stats were applied.
- * If `out_segment_root` is non-NULL and a segment was emitted (not
- * solely a doc-length update), it receives the BlockNumber of the
- * new L0 segment header *before* any subsequent L0->L1 compaction;
- * otherwise it is set to InvalidBlockNumber.
- *
- * Caller must already hold LW_EXCLUSIVE on the per-index lock.
- */
-bool tp_do_spill(
-		TpLocalIndexState *index_state,
-		Relation		   index_rel,
-		BlockNumber		  *out_segment_root);
 
 /*
  * Handler functions (am/handler.c)

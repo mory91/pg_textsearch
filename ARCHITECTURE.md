@@ -64,6 +64,14 @@ disposable. Writes update only the on-disk chain. Readers lazily build or catch
 up the cache; generation mismatches, spills, eviction, or memory pressure can
 drop it without affecting correctness. Standbys read the on-disk chain.
 
+Registry entries are keyed by database and index OID. Rebuilds preserve the
+shared allocation and its locks so existing backends retain valid wrappers.
+A successful build clears the cache in place and advances its generation.
+Cache cursors also record the relation's physical file identity: REINDEX,
+TRUNCATE, and rollback must never resume a cursor in a replacement file.
+Chain-page counts are lazily recounted against that same file identity
+before spill threshold checks; shutdown spills skip a busy recount lock.
+
 `pg_textsearch.memory_limit` has three budget tiers:
 
 - per-index per-record growth guard (`limit / 8`): reject a record whose
@@ -102,6 +110,11 @@ exclusive waiter has acquired. A shared acquirer can pass the gate just before
 the count changes, but only that bounded set can barge; a continuing stream of
 new readers cannot starve the exclusive waiter.
 
+Memtable writers also use a fair per-index writer/spill gate. Appends take it
+in shared mode before the per-index LWLock; spill takes it exclusively so the
+published chain stays stable while its segment is built. Ranked readers do not
+take this gate.
+
 Compaction, force merge, and VACUUM segment mutation serialize with an
 exclusive per-index heavyweight object lock in pg_textsearch's private
 `pg_am` subobject namespace. Its discriminator is distinct from managed
@@ -113,8 +126,9 @@ Graph publication also uses a private per-index publication barrier. Runtime
 compaction and VACUUM replacement acquire maintenance, then the publication
 barrier in `ExclusiveLock`, then phase-specific per-index LWLocks. Spill
 publication does not use maintenance; it acquires the publication barrier in
-`ShareLock` before `LW_EXCLUSIVE`. No path acquires the publication barrier or
-maintenance while holding the per-index LWLock.
+`ShareLock`, the writer/spill gate in exclusive mode, and then phase-specific
+per-index LWLocks. No path acquires the publication barrier, maintenance, or
+writer/spill gate while holding the per-index LWLock.
 
 Buffer ordering then follows the storage operation. Existing-tail memtable
 extension is tail -> new page -> metapage. The common read snapshot uses
@@ -127,6 +141,28 @@ unpublished page.
 No path may request maintenance while holding the per-index lock. A spill
 therefore completes L0 publication and releases `LW_EXCLUSIVE` before applying
 the configured compaction policy.
+
+### Spill phases
+
+A runtime spill holds the publication barrier and writer/spill gate across
+three phases:
+
+1. **Freeze and extract.** Briefly take the per-index lock in
+   `LW_EXCLUSIVE`, recheck the threshold, and extract the stable memtable
+   chain.
+2. **Build.** Release the per-index lock and write the complete WAL-logged but
+   unreachable L0 segment. Readers continue to scan the unchanged chain;
+   writers wait on the writer/spill gate.
+3. **Publish.** Briefly retake `LW_EXCLUSIVE`, publish the segment, disconnect
+   and stamp the old chain for deferred reclaim, and advance the cache spill
+   generation.
+
+An error before publication discards the unreachable segment and leaves the
+old chain published. Ownership transfers at WAL publication, before cache
+cleanup or chain retirement; a later error must not discard the live segment.
+Shutdown's no-wait spill skips busy publication, writer-gate, and per-index
+locks. If the publication-phase index lock is busy, it discards the unpublished
+output. Buffer, WAL, and I/O work may still wait after admission.
 
 The `compaction` index option controls spill-time behavior:
 
@@ -239,6 +275,12 @@ the index owner. The owner must have `LOGIN`; a superuser owner also requires
 API through extension metadata and records a normal extension dependency
 after the first successful activation.
 
+The pg_durable extension and BM25 index must be in the same database.
+pg_durable's `database` argument routes SQL activities after submission; it
+does not expose `df.start`, `df.signal`, or workflow metadata in another
+database. pg_textsearch rejects background mode when `pg_durable.database`
+names a different database. Use `manual` mode there.
+
 Each physical background index has one owner-scoped workflow identified by
 its database, physical relation identity, owner, schedule, and protocol
 version. The workflow runs a stepped cascade immediately, then waits for a
@@ -294,6 +336,12 @@ standby snapshots that start on the old graph before publication cannot
 advance the reclaim horizon past it. Restamping scales with the number of
 tombstone containers but does not extend runtime reader exclusion. Selected
 source pages are never returned directly to the FSM.
+
+Tombstone drain unlinks a reclaimable batch under `LW_EXCLUSIVE`, then releases
+the per-index lock before stamping its already-unreachable pages free and
+returning them to the FSM. Free-before-unlink is forbidden; unlink-before-free
+is safe, and an error during the unlocked free loop can only leak the
+unfinished remainder until `REINDEX`.
 
 Metapage V8 already contains `pending_free_head`; compaction preserves that
 existing chain when upgrading and publishing. Only older metapage versions

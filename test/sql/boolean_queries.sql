@@ -72,6 +72,13 @@ SELECT pg_temp.first_plan_child($query$
     ORDER BY d.body <@> to_bm25query('refund', 'boolean_docs_body_idx')
     LIMIT 1
 $query$) = 'Sort' AS unsupported_join_path_falls_back;
+SELECT (
+    SELECT id
+    FROM boolean_docs
+    WHERE body @@ to_tsquery('english', 'fraud')
+    ORDER BY body <@> to_bm25query('refund', 'boolean_docs_body_idx')
+    LIMIT 1
+) = 2 AS combined_query_ranks_matches;
 RESET enable_nestloop;
 RESET enable_sort;
 \pset format aligned

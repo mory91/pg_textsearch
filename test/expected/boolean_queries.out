@@ -82,6 +82,16 @@ $query$) = 'Sort' AS unsupported_join_path_falls_back;
 unsupported_join_path_falls_back
 t
 (1 row)
+SELECT (
+    SELECT id
+    FROM boolean_docs
+    WHERE body @@ to_tsquery('english', 'fraud')
+    ORDER BY body <@> to_bm25query('refund', 'boolean_docs_body_idx')
+    LIMIT 1
+) = 2 AS combined_query_ranks_matches;
+combined_query_ranks_matches
+t
+(1 row)
 RESET enable_nestloop;
 RESET enable_sort;
 \pset format aligned
